@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>GPU Stress — Maximum Load</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:monospace}
+  canvas{display:block;width:100vw;height:100vh}
+  #hud{position:fixed;top:10px;left:10px;color:#0f0;font-size:14px;
+       text-shadow:0 0 4px #0f0;pointer-events:none;white-space:pre;z-index:10}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">FPS: --</div>
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', {antialias:false, powerPreference:'high-performance'});
+if(!gl){ document.body.innerHTML = '<h2 style="color:red;font-family:sans-serif">WebGL2 не поддерживается</h2>'; }
+
+const vsSource = `#version 300 es
+in vec2 pos;
+void main(){ gl_Position = vec4(pos,0.0,1.0); }`;
+
+const fsSource = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+uniform vec2  uRes;
+uniform float uTime;
+
+// ---------- ХЕШ И ШУМ ----------
+float hash(vec3 p){
+   p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+   p *= 17.0;
+   return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float noise(vec3 x){
+   vec3 i = floor(x);
+   vec3 f = fract(x);
+   f = f * f * (3.0 - 2.0 * f);
+   return mix(mix(mix(hash(i + vec3(0,0,0)), hash(i + vec3(1,0,0)), f.x),
+                  mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+              mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+                  mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+
+// 8 октав fBm
+float fbm(vec3 p){
+   float v = 0.0, a = 0.5;
+   for(int i=0;i<8;i++){
+       v += a * noise(p);
+       p = p * 2.03 + vec3(1.7, 9.2, 3.3);
+       a *= 0.5;
+   }
+   return v;
+}
+
+// ---------- КЕРНЕЛ (20 итераций) ----------
+float kernal(vec3 ver){
+   vec3 a = ver;
+   float b, c, d;
+   for(int i=0;i<20;i++){
+       b = length(a);
+       c = atan(a.y, a.x) * 8.0;
+       d = acos(a.z / b) * 8.0;
+       b = pow(b, 8.0);
+       a = vec3(b*sin(d)*cos(c), b*sin(d)*sin(c), b*cos(d)) + ver;
+       if(b > 6.0) break;
+   }
+   return 4.0 - dot(a, a);
+}
+
+// ---------- MANDELBULB DE (12 итераций) ----------
+float mandelbulbDE(vec3 pos){
+   vec3 z = pos;
+   float dr = 1.0, r = 0.0;
+   const float power = 8.0;
+   for(int i=0;i<12;i++){
+       r = length(z);
+       if(r > 2.0) break;
+       float theta = acos(z.z / r) * power;
+       float phi   = atan(z.y, z.x) * power;
+       float zr    = pow(r, power);
+       dr = pow(r, power - 1.0) * power * dr + 1.0;
+       z = zr * vec3(sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta)) + pos;
+   }
+   return 0.5 * log(r) * r / dr;
+}
+
+// ---------- ЗЛАЯ ФУНКЦИЯ РАССТОЯНИЯ ----------
+float map(vec3 p){
+   float d1 = mandelbulbDE(p * 0.9);
+   float k  = kernal(p * 1.3 + vec3(0.0, 0.0, 1.2));
+   float n  = fbm(p * 3.0 + uTime * 0.3);
+   float s  = sin(p.x * 4.0 + uTime) * cos(p.y * 4.0 - uTime)
+            * sin(p.z * 4.0 + uTime * 0.5);
+   return mandelbulbDE(p * 0.9);
+}
+
+vec3 calcNormal(vec3 p){
+   vec2 e = vec2(0.0006, 0.0);
+   return normalize(vec3(
+       map(p + e.xyy) - map(p - e.xyy),
+       map(p + e.yxy) - map(p - e.yxy),
+       map(p + e.yyx) - map(p - e.yyx)
+   ));
+}
+
+// ---------- RAYMARCHING (300 шагов) ----------
+float raymarch(vec3 ro, vec3 rd, out vec3 hitPos){
+   float t = 0.0;
+   for(int i=0;i<300;i++){
+       vec3 p = ro + rd * t;
+       float d = map(p);
+       if(d < 0.0008){ hitPos = p; return t; }
+       t += d * 0.9;
+       if(t > 20.0) break;
+   }
+   return -1.0;
+}
+
+// ---------- ОБЪЁМНЫЙ ТУМАН (50 шагов) ----------
+float volumetricFog(vec3 ro, vec3 rd, float tmax){
+   float acc = 0.0;
+   float t = 0.0;
+   for(int i=0;i<50;i++){
+       vec3 p = ro + rd * t;
+       float n = fbm(p * 2.0 + uTime * 0.2);
+       acc += n * 0.03;
+       t += tmax / 50.0;
+   }
+   return acc;
+}
+
+void main(){
+   vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+
+   float ang = uTime * 0.35;
+   vec3 ro = vec3(sin(ang) * 2.6, 0.9, cos(ang) * 2.6);
+   vec3 ta = vec3(0.0);
+   vec3 fwd   = normalize(ta - ro);
+   vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), fwd));
+   vec3 up    = cross(fwd, right);
+   vec3 rd = normalize(uv.x * right + uv.y * up + 1.5 * fwd);
+
+   vec3 col = vec3(0.0);
+   vec3 hp;
+   float t = raymarch(ro, rd, hp);
+
+   if(t > 0.0){
+       vec3 n = calcNormal(hp);
+
+       vec3 l1 = normalize(vec3(0.8, 0.9, 0.5));
+       vec3 l2 = normalize(vec3(-0.6, 0.3, -0.7));
+       vec3 l3 = normalize(vec3(0.2, -0.8, 0.4));
+       float d1 = max(dot(n, l1), 0.0);
+       float d2 = max(dot(n, l2), 0.0);
+       float d3 = max(dot(n, l3), 0.0);
+
+       vec3 base = 0.5 + 0.5 * cos(vec3(0.0, 2.0, 4.0)
+                                   + n.x * 3.0 + n.z * 3.0 + uTime);
+       base *= 0.7 + 0.6 * fbm(hp * 5.0);
+
+       col = base * (0.1 + 0.7*d1 + 0.35*d2 + 0.2*d3);
+
+       vec3 vd = -rd;
+       vec3 h1 = normalize(l1 + vd);
+       vec3 h2 = normalize(l2 + vd);
+       col += vec3(1.0) * pow(max(dot(n, h1), 0.0), 64.0) * 0.5;
+       col += vec3(0.6, 0.8, 1.0) * pow(max(dot(n, h2), 0.0), 32.0) * 0.3;
+
+       float fog = volumetricFog(ro, rd, t);
+       col = mix(col, vec3(0.05, 0.03, 0.1), clamp(fog, 0.0, 1.0));
+
+       col *= exp(-0.06 * t);
+   } else {
+       float n = fbm(rd * 4.0 + uTime * 0.1);
+       col = mix(vec3(0.01, 0.01, 0.03), vec3(0.08, 0.04, 0.12), n);
+   }
+
+   col = col / (col + vec3(1.0));
+   col = pow(col, vec3(0.4545));
+   fragColor = vec4(col, 1.0);
+}`;
+
+function compile(type, src){
+   const s = gl.createShader(type);
+   gl.shaderSource(s, src); gl.compileShader(s);
+   if(!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+       console.error('Shader error:', gl.getShaderInfoLog(s));
+   return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSource));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSource));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    console.error('Link error:', gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, 'pos');
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const uRes  = gl.getUniformLocation(prog, 'uRes');
+const uTime = gl.getUniformLocation(prog, 'uTime');
+
+function resize(){
+   const dpr = Math.min(window.devicePixelRatio, 1.5);
+   canvas.width  = Math.floor(innerWidth  * dpr);
+   canvas.height = Math.floor(innerHeight * dpr);
+   gl.viewport(0,0,canvas.width,canvas.height);
+}
+addEventListener('resize', resize); resize();
+
+const hud = document.getElementById('hud');
+let last = performance.now(), frames = 0, acc = 0;
+const start = performance.now();
+
+function frame(now){
+   const dt = now - last; last = now;
+   acc += dt; frames++;
+   if(acc > 500){
+       hud.textContent = 'FPS: ' + (frames*1000/acc).toFixed(1) +
+                         '\nРазрешение: ' + canvas.width + 'x' + canvas.height;
+       frames = 0; acc = 0;
+   }
+   gl.uniform2f(uRes, canvas.width, canvas.height);
+   gl.uniform1f(uTime, (now - start) * 0.001);
+   gl.drawArrays(gl.TRIANGLES, 0, 3);
+   requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
